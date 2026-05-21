@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>NiiVue Matrix Explorer</title>
+  <script src="https://cdn.jsdelivr.net/npm/@niivue/niivue@0.66.0/dist/niivue.umd.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      display: flex;
+      height: 100vh;
+      background: #000;
+      overflow: hidden;
+      font-family: monospace;
+      color: #fff;
+    }
+
+    #left { flex: 1; position: relative; }
+
+    #viewer {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    #fileLoader {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 20;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    #fileLoader label { color: #aaa; font-size: 12px; }
+    #fileLoader input[type="file"] { color: #aaa; font-size: 12px; }
+
+    #right {
+      width: 420px;
+      border-left: 1px solid #222;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px;
+      overflow: auto;
+    }
+
+    #mode-btn {
+      background: #222;
+      color: #fff;
+      border: 1px solid #555;
+      padding: 5px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 11px;
+      width: fit-content;
+    }
+
+    #mode-btn:hover { background: #333; }
+    #mode-btn.active { border-color: #fff; }
+
+    #info { color: #aaa; font-size: 11px; }
+
+    #matrix-canvas {
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+      cursor: crosshair;
+    }
+
+    #tooltip {
+      position: fixed;
+      background: rgba(0,0,0,0.85);
+      color: #fff;
+      border: 1px solid #444;
+      padding: 3px 7px;
+      border-radius: 3px;
+      font-size: 11px;
+      pointer-events: none;
+      display: none;
+      z-index: 9999;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="left">
+    <canvas id="viewer"></canvas>
+    <div id="fileLoader">
+      <label for="volumeInput">Volume (.nii, .nrrd, .nii.gz…)</label>
+      <input type="file" id="volumeInput">
+    </div>
+  </div>
+
+  <div id="right">
+    <button id="mode-btn">mode: hover</button>
+    <span id="info">load a volume and hover over the viewer</span>
+    <canvas id="matrix-canvas"></canvas>
+  </div>
+
+  <div id="tooltip"></div>
+
+  <script>
+    // niivue setup
+    const nv = new niivue.Niivue({
+      textHeight: 0.02,
+      crosshairColor: [0, 1, 1, 0.1],
+      crosshairWidth: 0.2,
+      show3Dcrosshair: true,
+    });
+
+    const viewerCanvas = document.getElementById('viewer');
+    nv.attachToCanvas(viewerCanvas);
+
+    function resizeViewer() {
+      const panel = document.getElementById('left');
+      viewerCanvas.width  = panel.clientWidth;
+      viewerCanvas.height = panel.clientHeight;
+      nv.resizeListener();
+    }
+    resizeViewer();
+    window.addEventListener('resize', resizeViewer);
+
+    // file loader
+    document.getElementById('volumeInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      await nv.loadVolumes([{ url: URL.createObjectURL(file), name: file.name }]);
+      nv.setSliceType(nv.sliceTypeAxial);
+      document.getElementById('fileLoader').style.display = 'none';
+    });
+
+    // matrix state
+    const matrixCanvas = document.getElementById('matrix-canvas');
+    const ctx          = matrixCanvas.getContext('2d');
+    const tooltip      = document.getElementById('tooltip');
+    const info         = document.getElementById('info');
+    const MAX_DISPLAY  = 32;
+    const HOVER_SIZE   = 8;
+
+    let state      = { pixels: null, cols: 0, rows: 0, cellSize: 1, dispCols: 0, dispRows: 0 };
+    let selectMode = false;
+
+    // reads an 8x8 neighborhood from v.img around the cursor position
+    function getHoverRegion(canvasX, canvasY) {
+      if (!nv.volumes || nv.volumes.length === 0) return null;
+      const v = nv.volumes[0];
+      if (!v.img) return null;
+
+      const frac = nv.canvasPos2frac([canvasX, canvasY]);
+      if (!frac) return null;
+      if (frac[0] < 0 || frac[0] > 1 ||
+          frac[1] < 0 || frac[1] > 1 ||
+          frac[2] < 0 || frac[2] > 1) return null;
+
+      const nx = v.dims[1];
+      const ny = v.dims[2];
+      const nz = v.dims[3];
+
+      // frac -> voxel index, clamped
+      const vx = Math.min(nx - 1, Math.max(0, Math.round(frac[0] * (nx - 1))));
+      const vy = Math.min(ny - 1, Math.max(0, Math.round(frac[1] * (ny - 1))));
+      const vz = Math.min(nz - 1, Math.max(0, Math.round(frac[2] * (nz - 1))));
+
+      const half   = Math.floor(HOVER_SIZE / 2);
+      const img    = v.img;
+      const pixels = new Float32Array(HOVER_SIZE * HOVER_SIZE);
+      let cols = HOVER_SIZE, rows = HOVER_SIZE;
+
+      // safe read from flat 3d array, NaN if out of bounds
+      function voxVal(x, y, z) {
+        if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) return NaN;
+        return img[x + y * nx + z * nx * ny];
+      }
+
+      const st = nv.opts.sliceType;
+
+      // rows are reversed so matrix top matches screen top (radiological convention)
+      if (st === nv.sliceTypeAxial) {
+        for (let r = 0; r < HOVER_SIZE; r++) {
+          for (let c = 0; c < HOVER_SIZE; c++) {
+            pixels[r * HOVER_SIZE + c] = voxVal(vx - half + c, vy + half - 1 - r, vz);
+          }
+        }
+      } else if (st === nv.sliceTypeCoronal) {
+        for (let r = 0; r < HOVER_SIZE; r++) {
+          for (let c = 0; c < HOVER_SIZE; c++) {
+            pixels[r * HOVER_SIZE + c] = voxVal(vx - half + c, vy, vz + half - 1 - r);
+          }
+        }
+      } else if (st === nv.sliceTypeSagittal) {
+        for (let r = 0; r < HOVER_SIZE; r++) {
+          for (let c = 0; c < HOVER_SIZE; c++) {
+            pixels[r * HOVER_SIZE + c] = voxVal(vx, vy - half + c, vz + half - 1 - r);
+          }
+        }
+      } else {
+        return null;
+      }
+
+      return { pixels, cols, rows, vx, vy, vz };
+    }
+
+    // render the matrix grid on the right panel canvas
+    function renderMatrix(pixels, cols, rows) {
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < pixels.length; i++) {
+        if (Number.isNaN(pixels[i])) continue;
+        if (pixels[i] < min) min = pixels[i];
+        if (pixels[i] > max) max = pixels[i];
+      }
+      if (!Number.isFinite(min)) return;
+      const range = max - min || 1;
+
+      const dispCols = Math.min(cols, MAX_DISPLAY);
+      const dispRows = Math.min(rows, MAX_DISPLAY);
+      const stepX    = cols / dispCols;
+      const stepY    = rows / dispRows;
+      const cellSize = Math.max(4, Math.min(40, Math.floor(400 / dispCols), Math.floor(600 / dispRows)));
+
+      state = { pixels, cols, rows, cellSize, dispCols, dispRows };
+
+      matrixCanvas.width  = dispCols * cellSize;
+      matrixCanvas.height = dispRows * cellSize;
+
+      ctx.font         = `${Math.max(8, Math.floor(cellSize * 0.28))}px monospace`;
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+
+      for (let dy = 0; dy < dispRows; dy++) {
+        for (let dx = 0; dx < dispCols; dx++) {
+          const val  = pixels[Math.floor(dy * stepY) * cols + Math.floor(dx * stepX)];
+          const oob  = Number.isNaN(val);
+          const norm = oob ? 0 : (val - min) / range;
+          const g    = Math.round(norm * 255);
+
+          ctx.fillStyle = oob ? '#1a0000' : `rgb(${g},${g},${g})`;
+          ctx.fillRect(dx * cellSize, dy * cellSize, cellSize, cellSize);
+
+          if (cellSize >= 6) {
+            ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+            ctx.lineWidth   = 0.5;
+            ctx.strokeRect(dx * cellSize + 0.5, dy * cellSize + 0.5, cellSize - 1, cellSize - 1);
+          }
+
+          if (!oob) {
+            ctx.fillStyle = norm > 0.55 ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.8)';
+            ctx.fillText(val.toFixed(0), dx * cellSize + cellSize / 2, dy * cellSize + cellSize / 2);
+          }
+        }
+      }
+
+      const subsampled = cols > MAX_DISPLAY || rows > MAX_DISPLAY;
+      info.textContent = `${cols}×${rows} vox  [${min.toFixed(0)}, ${max.toFixed(0)}]` +
+        (subsampled ? `  (${dispCols}×${dispRows} shown)` : '');
+    }
+
+    // hover on viewer
+    viewerCanvas.addEventListener('mousemove', (e) => {
+      if (selectMode || !nv.volumes || nv.volumes.length === 0) return;
+
+      const rect   = viewerCanvas.getBoundingClientRect();
+      const region = getHoverRegion(e.clientX - rect.left, e.clientY - rect.top);
+      if (!region) return;
+
+      renderMatrix(region.pixels, region.cols, region.rows);
+    });
+
+    // box select (stub)
+    const modeBtn = document.getElementById('mode-btn');
+
+    modeBtn.addEventListener('click', () => {
+      selectMode = !selectMode;
+      modeBtn.textContent = `mode: ${selectMode ? 'box select' : 'hover'}`;
+      modeBtn.classList.toggle('active', selectMode);
+      nv.opts.dragMode  = selectMode ? nv.dragModes.callbackOnly : nv.dragModes.slicer3D;
+      nv.onDragRelease  = selectMode ? (...args) => console.log('drag args:', args) : null;
+    });
+
+    // tooltip on matrix hover
+    matrixCanvas.addEventListener('mousemove', (e) => {
+      if (!state.pixels) return;
+      const rect = matrixCanvas.getBoundingClientRect();
+      const dx   = Math.floor((e.clientX - rect.left) / (rect.width  / state.dispCols));
+      const dy   = Math.floor((e.clientY - rect.top)  / (rect.height / state.dispRows));
+      const sx   = Math.floor(dx * (state.cols / state.dispCols));
+      const sy   = Math.floor(dy * (state.rows / state.dispRows));
+      if (sx >= 0 && sy >= 0 && sx < state.cols && sy < state.rows) {
+        const val = state.pixels[sy * state.cols + sx];
+        tooltip.style.display = 'block';
+        tooltip.style.left    = (e.clientX + 12) + 'px';
+        tooltip.style.top     = (e.clientY - 24) + 'px';
+        tooltip.textContent   = Number.isNaN(val) ? `[${sx},${sy}] OOB` : `[${sx},${sy}] = ${val}`;
+      }
+    });
+    matrixCanvas.addEventListener('mouseleave', () => tooltip.style.display = 'none');
+  </script>
+</body>
+</html>
