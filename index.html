@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>NiiVue Matrix Explorer</title>
+  <title>NiiVue Explorer</title>
   <script src="https://cdn.jsdelivr.net/npm/@niivue/niivue@0.66.0/dist/niivue.umd.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -16,7 +16,7 @@
       color: #fff;
     }
 
-    #left { flex: 1; position: relative; }
+    #left { flex: 1; position: relative; min-width: 0; }
 
     #viewer {
       position: absolute;
@@ -38,14 +38,30 @@
     #fileLoader label { color: #aaa; font-size: 12px; }
     #fileLoader input[type="file"] { color: #aaa; font-size: 12px; }
 
+    #sample-btn {
+      background: #222;
+      color: #aaa;
+      border: 1px solid #444;
+      padding: 4px 10px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-family: monospace;
+      font-size: 11px;
+      width: fit-content;
+    }
+    #sample-btn:hover { background: #333; color: #fff; }
+    #sample-btn:disabled { color: #555; cursor: default; }
+
     #right {
-      width: 420px;
+      width: 50vw;
+      height: 100vh;
       border-left: 1px solid #222;
       display: flex;
       flex-direction: column;
       gap: 8px;
       padding: 12px;
-      overflow: auto;
+      overflow: hidden;
+      flex-shrink: 0;
     }
 
     #mode-btn {
@@ -58,17 +74,22 @@
       font-family: monospace;
       font-size: 11px;
       width: fit-content;
+      flex-shrink: 0;
     }
 
     #mode-btn:hover { background: #333; }
     #mode-btn.active { border-color: #fff; }
 
-    #info { color: #aaa; font-size: 11px; }
+    #info { color: #aaa; font-size: 11px; flex-shrink: 0; }
 
     #matrix-canvas {
       image-rendering: pixelated;
       image-rendering: crisp-edges;
       cursor: crosshair;
+      display: block;
+      flex: 1;
+      min-height: 0;
+      width: 100%;
     }
 
     #tooltip {
@@ -92,6 +113,7 @@
     <div id="fileLoader">
       <label for="volumeInput">Volume (.nii, .nrrd, .nii.gz…)</label>
       <input type="file" id="volumeInput">
+      <button id="sample-btn">load sample data</button>
     </div>
   </div>
 
@@ -124,13 +146,36 @@
     resizeViewer();
     window.addEventListener('resize', resizeViewer);
 
-    // file loader
+    // hide the file loader once a volume is loaded
+    function onVolumeLoaded() {
+      nv.setSliceType(nv.sliceTypeAxial);
+      document.getElementById('fileLoader').style.display = 'none';
+    }
+
+    // file input loader
     document.getElementById('volumeInput').addEventListener('change', async (e) => {
       const file = e.target.files[0];
       if (!file) return;
       await nv.loadVolumes([{ url: URL.createObjectURL(file), name: file.name }]);
-      nv.setSliceType(nv.sliceTypeAxial);
-      document.getElementById('fileLoader').style.display = 'none';
+      onVolumeLoaded();
+    });
+
+    // sample data loader uses a nrrd ultrasound
+    document.getElementById('sample-btn').addEventListener('click', async () => {
+      const btn = document.getElementById('sample-btn');
+      btn.disabled = true;
+      btn.textContent = 'loading…';
+      try {
+        await nv.loadVolumes([{
+          url: './ultrasound.nrrd',
+          colormap: 'gray',
+        }]);
+        onVolumeLoaded();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = 'load sample data';
+        console.error('sample load failed:', err);
+      }
     });
 
     // matrix state
@@ -144,11 +189,28 @@
     let state      = { pixels: null, cols: 0, rows: 0, cellSize: 1, dispCols: 0, dispRows: 0 };
     let selectMode = false;
 
+    // in multiplanar mode NiiVue tiles the canvas as a 2x2 grid
+    //   top left: axial  |  top right: coronal
+    //   bot left: sagittal | bot right: 3D render - skip
+    function resolveSliceType(canvasX, canvasY) {
+      const st = nv.opts.sliceType;
+      if (st !== nv.sliceTypeMultiplanar) return st;
+      const midX = viewerCanvas.width  / 2;
+      const midY = viewerCanvas.height / 2;
+      if (canvasX < midX && canvasY < midY) return nv.sliceTypeAxial;
+      if (canvasX >= midX && canvasY < midY) return nv.sliceTypeCoronal;
+      if (canvasX < midX && canvasY >= midY) return nv.sliceTypeSagittal;
+      return null; // 3D quadrant — nothing useful to show
+    }
+
     // reads an 8x8 neighborhood from v.img around the cursor position
     function getHoverRegion(canvasX, canvasY) {
       if (!nv.volumes || nv.volumes.length === 0) return null;
       const v = nv.volumes[0];
       if (!v.img) return null;
+
+      const st = resolveSliceType(canvasX, canvasY);
+      if (st === null) return null;
 
       const frac = nv.canvasPos2frac([canvasX, canvasY]);
       if (!frac) return null;
@@ -168,15 +230,14 @@
       const half   = Math.floor(HOVER_SIZE / 2);
       const img    = v.img;
       const pixels = new Float32Array(HOVER_SIZE * HOVER_SIZE);
-      let cols = HOVER_SIZE, rows = HOVER_SIZE;
+      const cols   = HOVER_SIZE;
+      const rows   = HOVER_SIZE;
 
-      // safe read from flat 3d array, NaN if out of bounds
+      //  read from flat 3d array, NaN if out of bounds
       function voxVal(x, y, z) {
         if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) return NaN;
         return img[x + y * nx + z * nx * ny];
       }
-
-      const st = nv.opts.sliceType;
 
       // rows are reversed so matrix top matches screen top (radiological convention)
       if (st === nv.sliceTypeAxial) {
@@ -201,7 +262,7 @@
         return null;
       }
 
-      return { pixels, cols, rows, vx, vy, vz };
+      return { pixels, cols, rows, vx, vy, vz, sliceType: st };
     }
 
     // render the matrix grid on the right panel canvas
@@ -219,7 +280,11 @@
       const dispRows = Math.min(rows, MAX_DISPLAY);
       const stepX    = cols / dispCols;
       const stepY    = rows / dispRows;
-      const cellSize = Math.max(4, Math.min(40, Math.floor(400 / dispCols), Math.floor(600 / dispRows)));
+
+      // browser has already sized canvas so read what we actually got
+      const availW = matrixCanvas.clientWidth;
+      const availH = matrixCanvas.clientHeight;
+      const cellSize = Math.max(4, Math.floor(Math.min(availW / dispCols, availH / dispRows)));
 
       state = { pixels, cols, rows, cellSize, dispCols, dispRows };
 
