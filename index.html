@@ -80,7 +80,8 @@
     #mode-btn:hover { background: #333; }
     #mode-btn.active { border-color: #fff; }
 
-    #info { color: #aaa; font-size: 11px; flex-shrink: 0; }
+    #info  { color: #aaa; font-size: 11px; flex-shrink: 0; }
+    #debug { color: #666; font-size: 10px; flex-shrink: 0; line-height: 1.6; }
 
     #matrix-canvas {
       image-rendering: pixelated;
@@ -111,7 +112,7 @@
   <div id="left">
     <canvas id="viewer"></canvas>
     <div id="fileLoader">
-      <label for="volumeInput">Volume (.nii, .nrrd, .nii.gz…)</label>
+      <label for="volumeInput">Volume (.nii, .nrrd, .nii.gz...)</label>
       <input type="file" id="volumeInput">
       <button id="sample-btn">load sample data</button>
     </div>
@@ -120,13 +121,13 @@
   <div id="right">
     <button id="mode-btn">mode: hover</button>
     <span id="info">load a volume and hover over the viewer</span>
+    <div id="debug"></div>
     <canvas id="matrix-canvas"></canvas>
   </div>
 
   <div id="tooltip"></div>
 
   <script>
-    // niivue setup
     const nv = new niivue.Niivue({
       textHeight: 0.02,
       crosshairColor: [0, 1, 1, 0.1],
@@ -146,13 +147,48 @@
     resizeViewer();
     window.addEventListener('resize', resizeViewer);
 
-    // hide the file loader once a volume is loaded
+    // xform[fi] = { axis, flip } tells us which voxel axis frac[fi] maps to
+    // and whether it needs to be inverted. computed at load time from toRASvox
+    // (or matRAS as fallback for formats like NRRD that don't populate toRASvox).
+    let xform = null;
+
+    function decodeMatrix(m) {
+      // m is a column-major 4x4 Float32Array.
+      // each column fi maps frac[fi] to a voxel axis.
+      // the dominant row in that column is which voxel axis, sign tells us flip.
+      const cols = [];
+      for (let fi = 0; fi < 3; fi++) {
+        const base = fi * 4;
+        const abs  = [Math.abs(m[base+0]), Math.abs(m[base+1]), Math.abs(m[base+2])];
+        const axis = abs.indexOf(Math.max(...abs));
+        const flip = m[base + axis] < 0;
+        cols.push({ axis, flip });
+      }
+      return cols;
+    }
+
+    function computeXform() {
+      const v = nv.volumes && nv.volumes[0];
+      if (!v) return;
+      const m = v.toRASvox || v.matRAS;
+      if (!m) { xform = null; return; }
+      xform = decodeMatrix(m);
+      const dims = [v.dims[1], v.dims[2], v.dims[3]];
+      document.getElementById('debug').textContent =
+        'cal: [' + v.cal_min.toFixed(1) + ', ' + v.cal_max.toFixed(1) + ']' +
+        '  dims: ' + dims.join('x') +
+        '  fx->vox' + xform[0].axis + (xform[0].flip ? '(-)' : '(+)') +
+        '  fy->vox' + xform[1].axis + (xform[1].flip ? '(-)' : '(+)') +
+        '  fz->vox' + xform[2].axis + (xform[2].flip ? '(-)' : '(+)') +
+        '  src:' + (v.toRASvox ? 'toRASvox' : 'matRAS');
+    }
+
     function onVolumeLoaded() {
       nv.setSliceType(nv.sliceTypeAxial);
       document.getElementById('fileLoader').style.display = 'none';
+      computeXform();
     }
 
-    // file input loader
     document.getElementById('volumeInput').addEventListener('change', async (e) => {
       const file = e.target.files[0];
       if (!file) return;
@@ -160,16 +196,12 @@
       onVolumeLoaded();
     });
 
-    // sample data loader uses a nrrd ultrasound
     document.getElementById('sample-btn').addEventListener('click', async () => {
       const btn = document.getElementById('sample-btn');
       btn.disabled = true;
-      btn.textContent = 'loading…';
+      btn.textContent = 'loading...';
       try {
-        await nv.loadVolumes([{
-          url: './ultrasound.nrrd',
-          colormap: 'gray',
-        }]);
+        await nv.loadVolumes([{ url: './ultrasound.nrrd', colormap: 'gray' }]);
         onVolumeLoaded();
       } catch (err) {
         btn.disabled = false;
@@ -178,7 +210,6 @@
       }
     });
 
-    // matrix state
     const matrixCanvas = document.getElementById('matrix-canvas');
     const ctx          = matrixCanvas.getContext('2d');
     const tooltip      = document.getElementById('tooltip');
@@ -189,21 +220,77 @@
     let state      = { pixels: null, cols: 0, rows: 0, cellSize: 1, dispCols: 0, dispRows: 0 };
     let selectMode = false;
 
-    // in multiplanar mode NiiVue tiles the canvas as a 2x2 grid
-    //   top left: axial  |  top right: coronal
-    //   bot left: sagittal | bot right: 3D render - skip
+    // convert frac [0..1] to voxel indices using the orientation matrix.
+    // handles axis swaps and flips so this works regardless of how the
+    // scanner stored the data.
+    function frac2vox(frac, dims) {
+      const vox = [0, 0, 0];
+      if (!xform) {
+        return dims.map((d, i) => Math.min(d-1, Math.max(0, Math.round(frac[i] * (d-1)))));
+      }
+      for (let fi = 0; fi < 3; fi++) {
+        const { axis, flip } = xform[fi];
+        const f = flip ? (1 - frac[fi]) : frac[fi];
+        vox[axis] = Math.min(dims[axis]-1, Math.max(0, Math.round(f * (dims[axis]-1))));
+      }
+      return vox;
+    }
+
+    function sampleIdx(center, d, half, flip, max) {
+      const idx = flip ? (center + half - 1 - d) : (center - half + d);
+      return Math.min(max - 1, Math.max(0, idx));
+    }
+
+    // figure out which voxel axes are horizontal/vertical for the current slice view,
+    // and whether each needs to be flipped to match screen orientation.
+    //
+    // the flip rules come from two sources:
+    //   1. the orientation matrix (xform) tells us if a voxel axis runs backwards
+    //   2. canvasPos2frac inverts frac[1] relative to canvas Y (moving down on screen
+    //      decreases frac[1]), so anything driven by frac[1] as a vertical axis needs
+    //      an extra flip to compensate
+    //   3. frac[2] used as vertical (coronal/sagittal) also needs a flip because
+    //      screen-top = superior = high world Z
+    //
+    // slice views and which frac drives which screen direction:
+    //   axial:    horizontal=frac[0], vertical=frac[1]  (frac[2] is the fixed slice depth)
+    //   coronal:  horizontal=frac[0], vertical=frac[2]  (frac[1] is fixed)
+    //   sagittal: horizontal=frac[1], vertical=frac[2]  (frac[0] is fixed)
+    function getSliceLayout(st) {
+      if (!xform) return null;
+      if (st === nv.sliceTypeAxial) {
+        return {
+          hAxis: xform[0].axis, hFlip:  xform[0].flip,
+          vAxis: xform[1].axis, vFlip: !xform[1].flip,
+        };
+      } else if (st === nv.sliceTypeCoronal) {
+        return {
+          hAxis: xform[0].axis, hFlip:  xform[0].flip,
+          vAxis: xform[2].axis, vFlip: !xform[2].flip,
+        };
+      } else if (st === nv.sliceTypeSagittal) {
+        return {
+          hAxis: xform[1].axis, hFlip:  xform[1].flip,
+          vAxis: xform[2].axis, vFlip: !xform[2].flip,
+        };
+      }
+      return null;
+    }
+
+    // in multiplanar mode NiiVue tiles the canvas as a 2x2 grid:
+    //   top-left: axial  | top-right: coronal
+    //   bot-left: sagittal | bot-right: 3D render (we skip that one)
     function resolveSliceType(canvasX, canvasY) {
       const st = nv.opts.sliceType;
       if (st !== nv.sliceTypeMultiplanar) return st;
       const midX = viewerCanvas.width  / 2;
       const midY = viewerCanvas.height / 2;
-      if (canvasX < midX && canvasY < midY) return nv.sliceTypeAxial;
-      if (canvasX >= midX && canvasY < midY) return nv.sliceTypeCoronal;
-      if (canvasX < midX && canvasY >= midY) return nv.sliceTypeSagittal;
-      return null; // 3D quadrant — nothing useful to show
+      if (canvasX <  midX && canvasY <  midY) return nv.sliceTypeAxial;
+      if (canvasX >= midX && canvasY <  midY) return nv.sliceTypeCoronal;
+      if (canvasX <  midX && canvasY >= midY) return nv.sliceTypeSagittal;
+      return null;
     }
 
-    // reads an 8x8 neighborhood from v.img around the cursor position
     function getHoverRegion(canvasX, canvasY) {
       if (!nv.volumes || nv.volumes.length === 0) return null;
       const v = nv.volumes[0];
@@ -218,72 +305,65 @@
           frac[1] < 0 || frac[1] > 1 ||
           frac[2] < 0 || frac[2] > 1) return null;
 
-      const nx = v.dims[1];
-      const ny = v.dims[2];
-      const nz = v.dims[3];
+      const dims   = [v.dims[1], v.dims[2], v.dims[3]];
+      const vox    = frac2vox(frac, dims);
+      const layout = getSliceLayout(st);
+      if (!layout) return null;
 
-      // frac -> voxel index, clamped
-      const vx = Math.min(nx - 1, Math.max(0, Math.round(frac[0] * (nx - 1))));
-      const vy = Math.min(ny - 1, Math.max(0, Math.round(frac[1] * (ny - 1))));
-      const vz = Math.min(nz - 1, Math.max(0, Math.round(frac[2] * (nz - 1))));
+      const { hAxis, hFlip, vAxis, vFlip } = layout;
+      const fixedAxis = [0,1,2].find(a => a !== hAxis && a !== vAxis);
 
-      const half   = Math.floor(HOVER_SIZE / 2);
-      const img    = v.img;
+      const half = Math.floor(HOVER_SIZE / 2);
+      const img  = v.img;
+      const nx = dims[0], ny = dims[1], nz = dims[2];
+
       const pixels = new Float32Array(HOVER_SIZE * HOVER_SIZE);
-      const cols   = HOVER_SIZE;
-      const rows   = HOVER_SIZE;
 
-      //  read from flat 3d array, NaN if out of bounds
-      function voxVal(x, y, z) {
-        if (x < 0 || x >= nx || y < 0 || y >= ny || z < 0 || z >= nz) return NaN;
-        return img[x + y * nx + z * nx * ny];
+      function voxVal(coord) {
+        const [vi, vj, vk] = coord;
+        if (vi < 0 || vi >= nx || vj < 0 || vj >= ny || vk < 0 || vk >= nz) return NaN;
+        return img[vi + vj * nx + vk * nx * ny];
       }
 
-      // rows are reversed so matrix top matches screen top (radiological convention)
-      if (st === nv.sliceTypeAxial) {
-        for (let r = 0; r < HOVER_SIZE; r++) {
-          for (let c = 0; c < HOVER_SIZE; c++) {
-            pixels[r * HOVER_SIZE + c] = voxVal(vx - half + c, vy + half - 1 - r, vz);
-          }
+      for (let r = 0; r < HOVER_SIZE; r++) {
+        for (let c = 0; c < HOVER_SIZE; c++) {
+          const coord = [0, 0, 0];
+          coord[hAxis]     = sampleIdx(vox[hAxis], c, half, hFlip, dims[hAxis]);
+          coord[vAxis]     = sampleIdx(vox[vAxis], r, half, vFlip, dims[vAxis]);
+          coord[fixedAxis] = vox[fixedAxis];
+          pixels[r * HOVER_SIZE + c] = voxVal(coord);
         }
-      } else if (st === nv.sliceTypeCoronal) {
-        for (let r = 0; r < HOVER_SIZE; r++) {
-          for (let c = 0; c < HOVER_SIZE; c++) {
-            pixels[r * HOVER_SIZE + c] = voxVal(vx - half + c, vy, vz + half - 1 - r);
-          }
-        }
-      } else if (st === nv.sliceTypeSagittal) {
-        for (let r = 0; r < HOVER_SIZE; r++) {
-          for (let c = 0; c < HOVER_SIZE; c++) {
-            pixels[r * HOVER_SIZE + c] = voxVal(vx, vy - half + c, vz + half - 1 - r);
-          }
-        }
-      } else {
-        return null;
       }
 
-      return { pixels, cols, rows, vx, vy, vz, sliceType: st };
+      return { pixels, cols: HOVER_SIZE, rows: HOVER_SIZE, vx: vox[0], vy: vox[1], vz: vox[2], sliceType: st };
     }
 
-    // render the matrix grid on the right panel canvas
     function renderMatrix(pixels, cols, rows) {
-      let min = Infinity, max = -Infinity;
-      for (let i = 0; i < pixels.length; i++) {
-        if (Number.isNaN(pixels[i])) continue;
-        if (pixels[i] < min) min = pixels[i];
-        if (pixels[i] > max) max = pixels[i];
+      const v = nv.volumes[0];
+
+      // use NiiVue's windowing values so matrix brightness matches what's on screen.
+      // fall back to patch min/max if cal isn't set.
+      let globalMin = v.cal_min;
+      let globalMax = v.cal_max;
+
+      if (globalMin == null || globalMax == null || globalMin === globalMax) {
+        globalMin = Infinity; globalMax = -Infinity;
+        for (let i = 0; i < pixels.length; i++) {
+          if (Number.isNaN(pixels[i])) continue;
+          if (pixels[i] < globalMin) globalMin = pixels[i];
+          if (pixels[i] > globalMax) globalMax = pixels[i];
+        }
       }
-      if (!Number.isFinite(min)) return;
-      const range = max - min || 1;
+      if (!Number.isFinite(globalMin)) return;
+      const range = globalMax - globalMin || 1;
 
       const dispCols = Math.min(cols, MAX_DISPLAY);
       const dispRows = Math.min(rows, MAX_DISPLAY);
       const stepX    = cols / dispCols;
       const stepY    = rows / dispRows;
 
-      // browser has already sized canvas so read what we actually got
-      const availW = matrixCanvas.clientWidth;
-      const availH = matrixCanvas.clientHeight;
+      const availW   = matrixCanvas.clientWidth;
+      const availH   = matrixCanvas.clientHeight;
       const cellSize = Math.max(4, Math.floor(Math.min(availW / dispCols, availH / dispRows)));
 
       state = { pixels, cols, rows, cellSize, dispCols, dispRows };
@@ -291,7 +371,7 @@
       matrixCanvas.width  = dispCols * cellSize;
       matrixCanvas.height = dispRows * cellSize;
 
-      ctx.font         = `${Math.max(8, Math.floor(cellSize * 0.28))}px monospace`;
+      ctx.font         = Math.max(8, Math.floor(cellSize * 0.28)) + 'px monospace';
       ctx.textAlign    = 'center';
       ctx.textBaseline = 'middle';
 
@@ -299,10 +379,10 @@
         for (let dx = 0; dx < dispCols; dx++) {
           const val  = pixels[Math.floor(dy * stepY) * cols + Math.floor(dx * stepX)];
           const oob  = Number.isNaN(val);
-          const norm = oob ? 0 : (val - min) / range;
+          const norm = oob ? 0 : Math.max(0, Math.min(1, (val - globalMin) / range));
           const g    = Math.round(norm * 255);
 
-          ctx.fillStyle = oob ? '#1a0000' : `rgb(${g},${g},${g})`;
+          ctx.fillStyle = oob ? '#1a0000' : 'rgb(' + g + ',' + g + ',' + g + ')';
           ctx.fillRect(dx * cellSize, dy * cellSize, cellSize, cellSize);
 
           if (cellSize >= 6) {
@@ -319,33 +399,27 @@
       }
 
       const subsampled = cols > MAX_DISPLAY || rows > MAX_DISPLAY;
-      info.textContent = `${cols}×${rows} vox  [${min.toFixed(0)}, ${max.toFixed(0)}]` +
-        (subsampled ? `  (${dispCols}×${dispRows} shown)` : '');
+      info.textContent = cols + 'x' + rows + ' vox  [' + globalMin.toFixed(0) + ', ' + globalMax.toFixed(0) + ']' +
+        (subsampled ? '  (' + dispCols + 'x' + dispRows + ' shown)' : '');
     }
 
-    // hover on viewer
     viewerCanvas.addEventListener('mousemove', (e) => {
       if (selectMode || !nv.volumes || nv.volumes.length === 0) return;
-
       const rect   = viewerCanvas.getBoundingClientRect();
       const region = getHoverRegion(e.clientX - rect.left, e.clientY - rect.top);
       if (!region) return;
-
       renderMatrix(region.pixels, region.cols, region.rows);
     });
 
-    // box select (stub)
     const modeBtn = document.getElementById('mode-btn');
-
     modeBtn.addEventListener('click', () => {
       selectMode = !selectMode;
-      modeBtn.textContent = `mode: ${selectMode ? 'box select' : 'hover'}`;
+      modeBtn.textContent = 'mode: ' + (selectMode ? 'box select' : 'hover');
       modeBtn.classList.toggle('active', selectMode);
-      nv.opts.dragMode  = selectMode ? nv.dragModes.callbackOnly : nv.dragModes.slicer3D;
-      nv.onDragRelease  = selectMode ? (...args) => console.log('drag args:', args) : null;
+      nv.opts.dragMode = selectMode ? nv.dragModes.callbackOnly : nv.dragModes.slicer3D;
+      nv.onDragRelease = selectMode ? (...args) => console.log('drag args:', args) : null;
     });
 
-    // tooltip on matrix hover
     matrixCanvas.addEventListener('mousemove', (e) => {
       if (!state.pixels) return;
       const rect = matrixCanvas.getBoundingClientRect();
@@ -358,7 +432,7 @@
         tooltip.style.display = 'block';
         tooltip.style.left    = (e.clientX + 12) + 'px';
         tooltip.style.top     = (e.clientY - 24) + 'px';
-        tooltip.textContent   = Number.isNaN(val) ? `[${sx},${sy}] OOB` : `[${sx},${sy}] = ${val}`;
+        tooltip.textContent   = Number.isNaN(val) ? '[' + sx + ',' + sy + '] OOB' : '[' + sx + ',' + sy + '] = ' + val;
       }
     });
     matrixCanvas.addEventListener('mouseleave', () => tooltip.style.display = 'none');
