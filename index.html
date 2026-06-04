@@ -1,161 +1,64 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
+  <meta charset="UTF-8">
   <title>NiiVue Explorer</title>
+  <link rel="stylesheet" href="style.css">
   <script src="https://cdn.jsdelivr.net/npm/@niivue/niivue@0.66.0/dist/niivue.umd.min.js"></script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-
-    body {
-      display: flex;
-      height: 100vh;
-      background: #000;
-      color: #fff;
-      font-family: monospace;
-      overflow: hidden;
-    }
-
-    #left {
-      flex: 1;
-      position: relative;
-      min-width: 0;
-    }
-
-    #viewer {
-      position: absolute;
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
-
-    #fileLoader {
-      position: absolute;
-      top: 16px;
-      left: 16px;
-      z-index: 20;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    #fileLoader label, #fileLoader input { color: #aaa; font-size: 12px; }
-
-    #sample-btn {
-      background: #222;
-      border: 1px solid #444;
-      color: #aaa;
-      font-family: monospace;
-      font-size: 11px;
-      padding: 4px 10px;
-      border-radius: 3px;
-      cursor: pointer;
-    }
-    #sample-btn:hover { background: #333; color: #fff; }
-    #sample-btn:disabled { color: #555; cursor: default; }
-
-    #right {
-      width: 50vw;
-      height: 100vh;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      padding: 12px;
-      border-left: 1px solid #222;
-      overflow: hidden;
-      flex-shrink: 0;
-    }
-
-    #mode-btn {
-      background: #222;
-      color: #fff;
-      border: 1px solid #555;
-      font-family: monospace;
-      font-size: 11px;
-      padding: 5px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      width: fit-content;
-    }
-    #mode-btn:hover { background: #333; }
-    #mode-btn.active { border-color: #fff; }
-
-    #info { color: #aaa; font-size: 11px; }
-
-    #matrix-canvas {
-      display: block;
-      flex: 1;
-      min-height: 0;
-      width: 100%;
-      image-rendering: pixelated;
-      cursor: crosshair;
-    }
-
-    #tooltip {
-      position: fixed;
-      display: none;
-      background: rgba(0,0,0,0.85);
-      color: #fff;
-      border: 1px solid #444;
-      border-radius: 3px;
-      padding: 3px 7px;
-      font-size: 11px;
-      pointer-events: none;
-      z-index: 9999;
-    }
-  </style>
 </head>
 <body>
   <div id="left">
     <canvas id="viewer"></canvas>
     <div id="fileLoader">
-      <label for="volumeInput">Volume (.nii, .nrrd, .nii.gz...)</label>
       <input type="file" id="volumeInput">
-      <button id="sample-btn">load sample data</button>
+      <button id="sample-btn" class="btn">load sample data</button>
     </div>
   </div>
   <div id="right">
-    <button id="mode-btn">mode: hover</button>
-    <span id="info">load a volume and hover over the viewer</span>
+    <button id="mode-btn" class="btn">mode: crosshair</button>
+    <span id="info">load a volume</span>
     <canvas id="matrix-canvas"></canvas>
   </div>
-  <div id="tooltip"></div>
 
   <script>
-    // setup
-    const nv = new niivue.Niivue({ textHeight: 0.02, crosshairColor: [0,1,1,0.1], crosshairWidth: 0.2, show3Dcrosshair: true });
-    const viewerCanvas = document.getElementById('viewer');
-    const matrixCanvas = document.getElementById('matrix-canvas');
-    const ctx = matrixCanvas.getContext('2d');
-    const tooltip = document.getElementById('tooltip');
+
+    // sets up everything, attaches to viewer etc
+    const nv = new niivue.Niivue({
+      crosshairColor: [0, 1, 1, 0.1],
+      crosshairWidth: 0.2,
+      show3Dcrosshair: true
+    });
+    const viewer = document.getElementById('viewer');
+    const mc = document.getElementById('matrix-canvas');
+    const ctx = mc.getContext('2d');
+    const modeBtn = document.getElementById('mode-btn');
     const HALF = 4;
-
     let selectMode = false;
-    let mState = { data: null, dims: null };
 
-    nv.attachToCanvas(viewerCanvas);
+    nv.attachToCanvas(viewer);
 
-    // resize on window change
-    function resizeViewer() {
-      viewerCanvas.width = viewerCanvas.parentElement.clientWidth;
-      viewerCanvas.height = viewerCanvas.parentElement.clientHeight;
+    function resize() {
+      viewer.width = viewer.parentElement.clientWidth;
+      viewer.height = viewer.parentElement.clientHeight;
       nv.resizeListener();
     }
-    resizeViewer();
-    window.addEventListener('resize', resizeViewer);
+    resize();
+    window.addEventListener('resize', resize);
 
-    // loading
+    // load a volume and hides the file picker
     async function loadVolume(url, name) {
-      await nv.loadVolumes([{ url, name }]);
+      await nv.loadVolumes([{ url: url, name: name }]);
       nv.setSliceType(nv.sliceTypeAxial);
       document.getElementById('fileLoader').style.display = 'none';
     }
 
-    document.getElementById('volumeInput').addEventListener('change', (e) => {
-      const f = e.target.files[0];
-      if (f) loadVolume(URL.createObjectURL(f), f.name);
+    document.getElementById('volumeInput').addEventListener('change', async function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      loadVolume(URL.createObjectURL(file), file.name);
     });
 
-    document.getElementById('sample-btn').addEventListener('click', async (e) => {
+    document.getElementById('sample-btn').addEventListener('click', async function(e) {
       e.target.disabled = true;
       e.target.textContent = 'loading...';
       try {
@@ -166,120 +69,85 @@
       }
     });
 
-    // figure out what voxel neighborhood the mouse is over
-    function getRegion(canvasX, canvasY) {
-      if (!nv.volumes.length || nv.opts.sliceType === nv.sliceTypeMultiplanar) return null;
-
-      const frac = nv.canvasPos2frac([canvasX, canvasY]);
-      if (!frac || frac.some(f => f < 0 || f > 1)) return null;
-
-      const st = nv.opts.sliceType;
-      const v = nv.volumes[0];
-      const [vx, vy, vz] = v.convertFrac2Vox(frac);
-      const [nx, ny, nz] = [v.dims[1], v.dims[2], v.dims[3]];
-
-      const clamp = (val, max) => Math.max(0, Math.min(max - 1, Math.round(val)));
-
-      // build a 3D box around the cursor then flatten the axis that doesnt change
-      let start = [clamp(vx-HALF, nx), clamp(vy-HALF, ny), clamp(vz-HALF, nz)];
-      let end   = [clamp(vx+HALF, nx), clamp(vy+HALF, ny), clamp(vz+HALF, nz)];
-
-      if      (st === nv.sliceTypeAxial)    { start[2] = end[2] = clamp(vz, nz); }
-      else if (st === nv.sliceTypeCoronal)  { start[1] = end[1] = clamp(vy, ny); }
-      else if (st === nv.sliceTypeSagittal) { start[0] = end[0] = clamp(vx, nx); }
-      else return null;
-
-      const [data, dims] = v.getVolumeData(start, end);
-      return (data && dims) ? { data, dims, st } : null;
-    }
-
-    // draw the matrix
-    function drawMatrix({ data, dims, st }) {
-      const v = nv.volumes[0];
-      const min = v.cal_min ?? Math.min(...data);
-      const max = v.cal_max ?? Math.max(...data);
+    // render voxel values as a labeled grayscale grid
+    // getVolumeData returns dims as [X, Y, Z] and the collapsed axis has size 1
+    // the first non 1 dim is cols, second is rows
+    function drawMatrix(data, dims) {
+      const vol = nv.volumes[0];
+      const min = vol.cal_min;
+      const max = vol.cal_max;
       const range = max - min || 1;
 
-      // dims comes back as [X, Y, Z] coronal and sagittal have one axis = 1
-      // so we need to pick the right two depending on which slice we're on.
-      // also rows have to go bottom to top or the matrix is upside down
+      // find the two visible axes and skip the collapses axis
       let cols, rows;
-      if (st === nv.sliceTypeAxial)         { cols = dims[0]; rows = dims[1]; }
-      else if (st === nv.sliceTypeCoronal)  { cols = dims[0]; rows = dims[2]; }
-      else                                  { cols = dims[1]; rows = dims[2]; }
+      for (let i = 0; i < 3; i++) {
+        if (dims[i] > 1) {
+          if (cols === undefined) cols = dims[i];
+          else rows = dims[i];
+        }
+      }
 
-      const cellSize = Math.floor(Math.min(
-        matrixCanvas.clientWidth / cols,
-        matrixCanvas.clientHeight / rows
-      ));
-
-      mState = { data, dims: [cols, rows] };
-      matrixCanvas.width = cols * cellSize;
-      matrixCanvas.height = rows * cellSize;
-
-      ctx.font = Math.floor(cellSize * 0.28) + 'px monospace';
+      const cell = Math.floor(Math.min(mc.clientWidth / cols, mc.clientHeight / rows));
+      mc.width = cols * cell;
+      mc.height = rows * cell;
+      ctx.font = Math.floor(cell * 0.28) + 'px monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
 
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const val = data[c + (rows - 1 - r) * cols];
-          const norm = Math.max(0, Math.min(1, (val - min) / range));
+          const norm = (val - min) / range;
           const g = Math.round(norm * 255);
 
-          ctx.fillStyle = `rgb(${g},${g},${g})`;
-          ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
-
-          if (cellSize >= 6) {
-            ctx.strokeStyle = 'rgba(0,0,0,0.35)';
-            ctx.lineWidth = 0.5;
-            ctx.strokeRect(c * cellSize + 0.5, r * cellSize + 0.5, cellSize - 1, cellSize - 1);
-          }
+          ctx.fillStyle = 'rgb(' + g + ',' + g + ',' + g + ')';
+          ctx.fillRect(c * cell, r * cell, cell, cell);
 
           ctx.fillStyle = norm > 0.55 ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.8)';
-          ctx.fillText(val.toFixed(0), c * cellSize + cellSize / 2, r * cellSize + cellSize / 2);
+          ctx.fillText(val.toFixed(0), c * cell + cell / 2, r * cell + cell / 2);
         }
       }
 
       document.getElementById('info').textContent =
-        `${cols}x${rows} vox  [${min.toFixed(0)}, ${max.toFixed(0)}]`;
+        cols + 'x' + rows + ' vox  [' + min.toFixed(0) + ', ' + max.toFixed(0) + ']';
     }
 
-    // events
-    viewerCanvas.addEventListener('mousemove', (e) => {
-      if (selectMode || !nv.volumes.length) return;
-      const rect = viewerCanvas.getBoundingClientRect();
-      const region = getRegion(e.clientX - rect.left, e.clientY - rect.top);
-      // console.log(region);
-      if (region) drawMatrix(region);
-    });
+    // gets a neighborhood around the crosshair
+    // loc.vox is already in RAS coordinates which is what getVolumeData needs
+    // also getVolumeData clamps OOB coordinates itself so you don't need to deal with that
+    nv.onLocationChange = function(loc) {
+      if (!nv.volumes.length || selectMode) return;
 
-    matrixCanvas.addEventListener('mousemove', (e) => {
-      if (!mState.data) return;
-      const { data, dims } = mState;
-      const rect = matrixCanvas.getBoundingClientRect();
-      const c = Math.floor((e.clientX - rect.left) / rect.width  * dims[0]);
-      const r = Math.floor((e.clientY - rect.top)  / rect.height * dims[1]);
+      const vox = loc.vox;
+      const voxStart = [vox[0] - HALF, vox[1] - HALF, vox[2] - HALF];
+      const voxEnd   = [vox[0] + HALF, vox[1] + HALF, vox[2] + HALF];
 
-      if (c >= 0 && c < dims[0] && r >= 0 && r < dims[1]) {
-        tooltip.style.display = 'block';
-        tooltip.style.left = (e.clientX + 12) + 'px';
-        tooltip.style.top = (e.clientY - 24) + 'px';
-        tooltip.textContent = `[${c},${r}] = ${data[c + (dims[1] - 1 - r) * dims[0]].toFixed(0)}`;
-      }
-    });
-    matrixCanvas.addEventListener('mouseleave', () => tooltip.style.display = 'none');
+      // collapses the slice plane axis to a single voxel
+      // axial(0)  Z=2, coronal(1)  Y=1, sagittal(2)  X=0
+      let fixedAxis = 2;
+      if (nv.opts.sliceType === nv.sliceTypeCoronal)  fixedAxis = 1;
+      if (nv.opts.sliceType === nv.sliceTypeSagittal) fixedAxis = 0;
+      voxStart[fixedAxis] = vox[fixedAxis];
+      voxEnd[fixedAxis]   = vox[fixedAxis];
 
-    // box select (wip)
-    const modeBtn = document.getElementById('mode-btn');
-    modeBtn.addEventListener('click', () => {
+      const result = nv.volumes[0].getVolumeData(voxStart, voxEnd);
+      if (result[0] && result[1]) drawMatrix(result[0], result[1]);
+    };
+
+    // Handles box select mode. the drag coordinates already define a singleslice 
+    nv.onDragRelease = function(info) {
+      if (!nv.volumes.length || !selectMode) return;
+      if (info.tileIdx < 0) return;
+
+      const result = nv.volumes[0].getVolumeData(info.voxStart, info.voxEnd);
+      if (result[0] && result[1]) drawMatrix(result[0], result[1]);
+    };
+
+    // toggle between crosshair and box select
+    modeBtn.addEventListener('click', function() {
       selectMode = !selectMode;
-      modeBtn.textContent = 'mode: ' + (selectMode ? 'box select' : 'hover');
-      modeBtn.classList.toggle('active', selectMode);
+      modeBtn.textContent = 'mode: ' + (selectMode ? 'box select' : 'crosshair');
       nv.opts.dragMode = selectMode ? nv.dragModes.callbackOnly : nv.dragModes.slicer3D;
-      nv.onDragRelease = selectMode ? (...args) => {
-        // TODO the box select so that the region selected shows up in the matrix
-      } : null;
     });
   </script>
 </body>
