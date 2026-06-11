@@ -9,146 +9,206 @@
 <body>
   <div id="left">
     <canvas id="viewer"></canvas>
-    <div id="fileLoader">
-      <input type="file" id="volumeInput">
-      <button id="sample-btn" class="btn">load sample data</button>
-    </div>
+    <input type="file" id="volumeInput" title="Load a volume">
   </div>
+  
   <div id="right">
-    <button id="mode-btn" class="btn">mode: crosshair</button>
-    <span id="info">load a volume</span>
+    <span id="info">loading</span>
     <canvas id="matrix-canvas"></canvas>
   </div>
 
   <script>
-
     // sets up everything, attaches to viewer etc
     const nv = new niivue.Niivue({
       crosshairColor: [0, 1, 1, 0.1],
       crosshairWidth: 0.2,
-      show3Dcrosshair: true
+      show3Dcrosshair: true,
+      textHeight: 0
     });
+
     const viewer = document.getElementById('viewer');
     const mc = document.getElementById('matrix-canvas');
     const ctx = mc.getContext('2d');
-    const modeBtn = document.getElementById('mode-btn');
-    const HALF = 4;
-    let selectMode = false;
+    const infoBox = document.getElementById('info');
+    
+    // 9x9 hover neighborhood
+    const HALF = 4; 
+    let boxActive = false;
 
     nv.attachToCanvas(viewer);
 
+    // handles window resize 
     function resize() {
       viewer.width = viewer.parentElement.clientWidth;
       viewer.height = viewer.parentElement.clientHeight;
       nv.resizeListener();
     }
-    resize();
     window.addEventListener('resize', resize);
+    resize();
 
-    // load a volume and hides the file picker
-    async function loadVolume(url, name) {
-      await nv.loadVolumes([{ url: url, name: name }]);
-      nv.setSliceType(nv.sliceTypeAxial);
-      document.getElementById('fileLoader').style.display = 'none';
+    // enables native drag selection
+    nv.opts.dragMode = 5; 
+
+    // gets fractional coordinates from mouse event
+    function fracAt(e) {
+      const rect = viewer.getBoundingClientRect();
+      const frac = nv.canvasPos2frac([e.clientX - rect.left, e.clientY - rect.top]);
+      return frac && frac[0] >= 0 ? frac : null;
     }
 
-    document.getElementById('volumeInput').addEventListener('change', async function(e) {
-      const file = e.target.files[0];
-      if (!file) return;
-      loadVolume(URL.createObjectURL(file), file.name);
-    });
+    // samples region and draws it
+    function sampleRegion(voxA, voxB) {
+      if (!nv.volumes.length || !voxA || !voxB) return;
+      
+      // collapses the slice plane axis to a single voxel
+      // axial(0) Z=2, coronal(1) Y=1, sagittal(2) X=0
+      const fixedAxis = nv.opts.sliceType === nv.sliceTypeSagittal ? 0 
+                      : nv.opts.sliceType === nv.sliceTypeCoronal ? 1 : 2;
+      
+      const s = [...voxA];
+      const end = [...voxB];
+      s[fixedAxis] = end[fixedAxis] = Math.round((voxA[fixedAxis] + voxB[fixedAxis]) / 2);
 
-    document.getElementById('sample-btn').addEventListener('click', async function(e) {
-      e.target.disabled = true;
-      e.target.textContent = 'loading...';
-      try {
-        await loadVolume('./ultrasound.nrrd', 'ultrasound.nrrd');
-      } catch (err) {
-        e.target.disabled = false;
-        e.target.textContent = 'load sample data';
-      }
-    });
+      const [data, dims] = nv.volumes[0].getVolumeData(s, end);
+      if (data && dims) drawMatrix(data, dims);
+    }
 
-    // render voxel values as a labeled grayscale grid
-    // getVolumeData returns dims as [X, Y, Z] and the collapsed axis has size 1
-    // the first non 1 dim is cols, second is rows
-    function drawMatrix(data, dims) {
-      const vol = nv.volumes[0];
-      const min = vol.cal_min;
-      const max = vol.cal_max;
-      const range = max - min || 1;
-
-      // find the two visible axes and skip the collapses axis
-      let cols, rows;
-      for (let i = 0; i < 3; i++) {
-        if (dims[i] > 1) {
-          if (cols === undefined) cols = dims[i];
-          else rows = dims[i];
-        }
-      }
-
-      const cell = Math.floor(Math.min(mc.clientWidth / cols, mc.clientHeight / rows));
-      mc.width = cols * cell;
-      mc.height = rows * cell;
-      ctx.font = Math.floor(cell * 0.28) + 'px monospace';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const val = data[c + (rows - 1 - r) * cols];
-          const norm = (val - min) / range;
-          const g = Math.round(norm * 255);
-
-          ctx.fillStyle = 'rgb(' + g + ',' + g + ',' + g + ')';
-          ctx.fillRect(c * cell, r * cell, cell, cell);
-
-          ctx.fillStyle = norm > 0.55 ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.8)';
-          ctx.fillText(val.toFixed(0), c * cell + cell / 2, r * cell + cell / 2);
-        }
-      }
-
-      document.getElementById('info').textContent =
-        cols + 'x' + rows + ' vox  [' + min.toFixed(0) + ', ' + max.toFixed(0) + ']';
+    // creates the blue overlay if it does not exist
+    async function ensureOverlayLoaded() {
+      if (nv.volumes.length > 1) return;
+      const overlay = await nv.volumes[0].clone();
+      overlay.zeroImage(); 
+      overlay.colormap = 'blue';
+      overlay.opacity = 0.3;
+      overlay.cal_min = 0;
+      overlay.cal_max = 1;
+      nv.addVolume(overlay);
     }
 
     // gets a neighborhood around the crosshair
     // loc.vox is already in RAS coordinates which is what getVolumeData needs
-    // also getVolumeData clamps OOB coordinates itself so you don't need to deal with that
+    // also getVolumeData clamps OOB coordinates itself so you dont need to deal with that
     nv.onLocationChange = function(loc) {
-      if (!nv.volumes.length || selectMode) return;
+      if (boxActive || !nv.volumes.length) return;
+      const v = loc.vox;
+      sampleRegion(
+        [v[0] - HALF, v[1] - HALF, v[2] - HALF],
+        [v[0] + HALF, v[1] + HALF, v[2] + HALF]
+      );
+    };
 
-      const vox = loc.vox;
-      const voxStart = [vox[0] - HALF, vox[1] - HALF, vox[2] - HALF];
-      const voxEnd   = [vox[0] + HALF, vox[1] + HALF, vox[2] + HALF];
+    // clear box and resume hover on left click
+    viewer.addEventListener('mousedown', function(e) {
+      if (e.button === 0 && boxActive) {
+        boxActive = false;
+        
+        if (nv.volumes.length > 1) {
+          nv.volumes[1].zeroImage();
+          nv.updateGLVolume();
+        }
+
+        const frac = fracAt(e);
+        if (frac) {
+          const v = nv.frac2vox(frac);
+          sampleRegion(
+            [v[0] - HALF, v[1] - HALF, v[2] - HALF],
+            [v[0] + HALF, v[1] + HALF, v[2] + HALF]
+          );
+        }
+      }
+    });
+
+    // handles box select mode the drag coordinates already define a single slice
+    nv.onDragRelease = async function(info) {
+      if (info.voxStart[0] < 0) return; 
+      boxActive = true; 
+
+      await ensureOverlayLoaded();
+      nv.volumes[1].zeroImage();
 
       // collapses the slice plane axis to a single voxel
-      // axial(0)  Z=2, coronal(1)  Y=1, sagittal(2)  X=0
-      let fixedAxis = 2;
-      if (nv.opts.sliceType === nv.sliceTypeCoronal)  fixedAxis = 1;
-      if (nv.opts.sliceType === nv.sliceTypeSagittal) fixedAxis = 0;
-      voxStart[fixedAxis] = vox[fixedAxis];
-      voxEnd[fixedAxis]   = vox[fixedAxis];
+      // axial(0) Z=2, coronal(1) Y=1, sagittal(2) X=0
+      const fixedAxis = nv.opts.sliceType === nv.sliceTypeSagittal ? 0 
+                      : nv.opts.sliceType === nv.sliceTypeCoronal ? 1 : 2;
+      
+      const start = [...info.voxStart];
+      const end = [...info.voxEnd];
+      start[fixedAxis] = end[fixedAxis] = Math.round((info.voxStart[fixedAxis] + info.voxEnd[fixedAxis]) / 2);
 
-      const result = nv.volumes[0].getVolumeData(voxStart, voxEnd);
-      if (result[0] && result[1]) drawMatrix(result[0], result[1]);
+      const [data, dims] = nv.volumes[0].getVolumeData(start, end);
+      
+      const boxVoxels = new Float32Array(data.length).fill(1);
+      nv.volumes[1].setVolumeData(start, end, boxVoxels);
+      nv.updateGLVolume();
+
+      if (data && dims) drawMatrix(data, dims);
     };
 
-    // Handles box select mode. the drag coordinates already define a singleslice 
-    nv.onDragRelease = function(info) {
-      if (!nv.volumes.length || !selectMode) return;
-      if (info.tileIdx < 0) return;
+    // loads initial volume
+    (async () => {
+      try {
+        await nv.loadVolumes([{ url: './ultrasound.nrrd', name: 'ultrasound.nrrd' }]);
+        nv.setSliceType(nv.sliceTypeAxial);
+        infoBox.textContent = 'Hover to inspect, right click drag to select';
+      } catch {
+        infoBox.textContent = 'failed to load';
+      }
+    })();
 
-      const result = nv.volumes[0].getVolumeData(info.voxStart, info.voxEnd);
-      if (result[0] && result[1]) drawMatrix(result[0], result[1]);
-    };
-
-    // toggle between crosshair and box select
-    modeBtn.addEventListener('click', function() {
-      selectMode = !selectMode;
-      modeBtn.textContent = 'mode: ' + (selectMode ? 'box select' : 'crosshair');
-      nv.opts.dragMode = selectMode ? nv.dragModes.callbackOnly : nv.dragModes.slicer3D;
+    // load a volume from file picker
+    document.getElementById('volumeInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      await nv.loadVolumes([{ url: URL.createObjectURL(file), name: file.name }]);
+      nv.setSliceType(nv.sliceTypeAxial);
+      
+      if (nv.volumes.length > 1) {
+        nv.removeVolume(nv.volumes[1]);
+        boxActive = false;
+      }
     });
+
+    // render voxel values as a labeled grayscale grid
+    function drawMatrix(data, dims) {
+      const { cal_min, cal_max } = nv.volumes[0];
+      const range = cal_max - cal_min || 1;
+
+      // getVolumeData returns dims as X Y Z and the collapsed axis has size 1
+      // the first non 1 dim is cols second is rows
+      const [cols, rows] = dims.filter(d => d > 1);
+      if (!cols || !rows) return;
+
+      const cell = Math.floor(Math.min(mc.clientWidth / cols, mc.clientHeight / rows));
+      if (cell < 1) return;
+
+      mc.width = cols * cell;
+      mc.height = rows * cell;
+
+      const showLabels = cell >= 8;
+      if (showLabels) {
+        ctx.font = `${Math.max(Math.floor(cell * 0.28), 6)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+      }
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const val = data[c + (rows - 1 - r) * cols];
+          const norm = (val - cal_min) / range;
+          const g = Math.round(norm * 255);
+
+          ctx.fillStyle = `rgb(${g},${g},${g})`;
+          ctx.fillRect(c * cell, r * cell, cell, cell);
+
+          if (showLabels) {
+            ctx.fillStyle = norm > 0.55 ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.8)';
+            ctx.fillText(val.toFixed(0), c * cell + cell / 2, r * cell + cell / 2);
+          }
+        }
+      }
+
+      infoBox.textContent = `${cols}x${rows} vox [${cal_min.toFixed(0)}, ${cal_max.toFixed(0)}]`;
+    }
   </script>
 </body>
 </html>
