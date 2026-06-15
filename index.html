@@ -49,7 +49,7 @@
     // enables native drag selection
     nv.opts.dragMode = 5; 
 
-    // gets fractional coordinates from mouse event
+    // gets fractional coordinates from mouse event, returns an [x,y,z] . !!! Not in RAS space
     function fracAt(e) {
       const rect = viewer.getBoundingClientRect();
       const frac = nv.canvasPos2frac([e.clientX - rect.left, e.clientY - rect.top]);
@@ -58,14 +58,14 @@
 
     // samples region and draws it
     function sampleRegion(voxA, voxB) {
-      if (!nv.volumes.length || !voxA || !voxB) return;
+      if (!nv.volumes.length || !voxA || !voxB) return; // bails early if no volume
       
       // collapses the slice plane axis to a single voxel
-      // axial(0) Z=2, coronal(1) Y=1, sagittal(2) X=0
+      // axial(0) Z=2, coronal(1) Y=1, sagittal(2) X=0 so that you don't get a 3D chunk of data
       const fixedAxis = nv.opts.sliceType === nv.sliceTypeSagittal ? 0 
                       : nv.opts.sliceType === nv.sliceTypeCoronal ? 1 : 2;
       
-      const s = [...voxA];
+      const s = [...voxA]; // Makes a copy, instead of  a reference. 
       const end = [...voxB];
       s[fixedAxis] = end[fixedAxis] = Math.round((voxA[fixedAxis] + voxB[fixedAxis]) / 2);
 
@@ -75,7 +75,7 @@
 
     // creates the blue overlay if it does not exist
     async function ensureOverlayLoaded() {
-      if (nv.volumes.length > 1) return;
+      if (nv.volumes.length > 1) return; // ASks if there is more than 1 volume loaded, checks if overlay already exuists
       const overlay = await nv.volumes[0].clone();
       overlay.zeroImage(); 
       overlay.colormap = 'blue';
@@ -90,7 +90,7 @@
     // also getVolumeData clamps OOB coordinates itself so you dont need to deal with that
     nv.onLocationChange = function(loc) {
       if (boxActive || !nv.volumes.length) return;
-      const v = loc.vox;
+      const v = loc.vox; // Cursor position in RAS coordinates.
       sampleRegion(
         [v[0] - HALF, v[1] - HALF, v[2] - HALF],
         [v[0] + HALF, v[1] + HALF, v[2] + HALF]
@@ -120,25 +120,28 @@
 
     // handles box select mode the drag coordinates already define a single slice
     nv.onDragRelease = async function(info) {
-      if (info.voxStart[0] < 0) return; 
+      if (info.voxStart[0] < 0) return; // Makes sure the box drawn is actually valid. 
       boxActive = true; 
 
       await ensureOverlayLoaded();
-      nv.volumes[1].zeroImage();
+      nv.volumes[1].zeroImage(); // Zeroes out the overlay, clear. 
 
       // collapses the slice plane axis to a single voxel
       // axial(0) Z=2, coronal(1) Y=1, sagittal(2) X=0
       const fixedAxis = nv.opts.sliceType === nv.sliceTypeSagittal ? 0 
                       : nv.opts.sliceType === nv.sliceTypeCoronal ? 1 : 2;
       
-      const start = [...info.voxStart];
-      const end = [...info.voxEnd];
+      const start = [...info.voxStart]; // Defines the two corners of the box, so start is where you began drawing the box, end is where you stopped clickign. 
+      const end = [...info.voxEnd]; // Copies these two into new arrays. 
+
+
+      // Averages the 2 fixed axis parts. With this midpoints we can collapse the 3D shape into 2D slice. 
       start[fixedAxis] = end[fixedAxis] = Math.round((info.voxStart[fixedAxis] + info.voxEnd[fixedAxis]) / 2);
 
       const [data, dims] = nv.volumes[0].getVolumeData(start, end);
       
       const boxVoxels = new Float32Array(data.length).fill(1);
-      nv.volumes[1].setVolumeData(start, end, boxVoxels);
+      nv.volumes[1].setVolumeData(start, end, boxVoxels); // Fills the overlay volume with 1's from start point to end point. 
       nv.updateGLVolume();
 
       if (data && dims) drawMatrix(data, dims);
@@ -171,31 +174,36 @@
     // render voxel values as a labeled grayscale grid
     function drawMatrix(data, dims) {
       const { cal_min, cal_max } = nv.volumes[0];
-      const range = cal_max - cal_min || 1;
+      const range = cal_max - cal_min || 1; // ramnge between display values. 
 
       // getVolumeData returns dims as X Y Z and the collapsed axis has size 1
       // the first non 1 dim is cols second is rows
       const [cols, rows] = dims.filter(d => d > 1);
       if (!cols || !rows) return;
 
-      const cell = Math.floor(Math.min(mc.clientWidth / cols, mc.clientHeight / rows));
+      const cell = Math.floor(Math.min(mc.clientWidth / cols, mc.clientHeight / rows)); // picks between max cell width and max cell heigh. picks the smallest
       if (cell < 1) return;
 
-      mc.width = cols * cell;
+      mc.width = cols * cell; // make sure the canvas is the correct size to the amount of stuff. 
       mc.height = rows * cell;
 
+
+      // Figures out whether to show a label or not. needs to be changed IMO 
       const showLabels = cell >= 8;
       if (showLabels) {
         ctx.font = `${Math.max(Math.floor(cell * 0.28), 6)}px monospace`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
       }
+      
 
+      // Loops through every voxel in the region, draws a grey square for each one based on how bright it is. If the cells are
+      // big enough, it prints out raw number on top. 
       for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
           const val = data[c + (rows - 1 - r) * cols];
-          const norm = (val - cal_min) / range;
-          const g = Math.round(norm * 255);
+          const norm = (val - cal_min) / range; // Gives a range from 0 - 1, gets normalized to 0-255 in the line below. 
+          const g = Math.round(norm * 255); 
 
           ctx.fillStyle = `rgb(${g},${g},${g})`;
           ctx.fillRect(c * cell, r * cell, cell, cell);
