@@ -26,6 +26,8 @@
       textHeight: 0
     });
 
+    window.nv = nv;
+
     const viewer = document.getElementById('viewer');
     const mc = document.getElementById('matrix-canvas');
     const ctx = mc.getContext('2d');
@@ -56,7 +58,7 @@
       return frac && frac[0] >= 0 ? frac : null;
     }
 
-    // samples region and draws it
+    // samples region and draws it : only used in hover 
     function sampleRegion(voxA, voxB) {
       if (!nv.volumes.length || !voxA || !voxB) return; // bails early if no volume
       
@@ -67,7 +69,7 @@
       
       const s = [...voxA]; // Makes a copy, instead of  a reference. 
       const end = [...voxB];
-      s[fixedAxis] = end[fixedAxis] = Math.round((voxA[fixedAxis] + voxB[fixedAxis]) / 2);
+      s[fixedAxis] = end[fixedAxis] = Math.round((voxA[fixedAxis] + voxB[fixedAxis]) / 2); // Flattens axis, finds midpoint
 
       const [data, dims] = nv.volumes[0].getVolumeData(s, end);
       if (data && dims) drawMatrix(data, dims);
